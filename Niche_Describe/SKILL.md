@@ -208,10 +208,6 @@ After all four dimension scripts run, the agent reads the four CSVs directly to 
 - `build_graph.py` + `spatial_clustering.py` + `fdr_correct.py` → all inside `dim4_spatial_clustering.py`
 - `assemble_report.py` → dropped; agent does inline assembly from the four CSVs
 
-`references/` (load when needed, not always in context):
-
-- `references/methods.md` — formulas, literature sources, and the binarization math for each statistic; why JSD-vs-centroid and why Join Count for categorical labels.
-- `references/platform_notes.md` — per-platform (Visium / Visium HD / CosMx / Xenium / MERFISH / Stereo-seq) coordinate units, recommended graph definition, and typical distance scales. Consult this before guessing a coordinate unit or neighbor scheme.
 
 ## Dependencies
 
