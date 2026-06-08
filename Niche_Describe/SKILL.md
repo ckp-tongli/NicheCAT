@@ -1,6 +1,6 @@
 ---
 name: niche-description
-description: Quantitatively describe (characterize) pre-clustered cellular niches / cellular neighborhoods from spatial omics data. Use this whenever a user has ALREADY assigned niche / neighborhood / spatial-domain labels (e.g. from Schürch-style kNN clustering, BANKSY, CytoCommunity, GASTON, Seurat, etc.) and now wants a standardized QC / description report covering how broadly each niche appears across samples, how stable its composition is across samples, how diverse its internal cell-type makeup is, and whether it is spatially clustered within the tissue. Trigger this even when the user only says things like "describe my niches", "QC my neighborhoods", "are my niches reproducible / sample-specific", "how pure is each niche", "is niche X spatially clustered", or hands over a cell-by-gene matrix + coordinates + niche labels + sample IDs — even if they don't use the word "niche" explicitly. This skill does NOT discover or cluster niches (that is upstream) and does NOT interpret biological function (that is downstream); it produces the quantitative description that feeds those steps.
+description: Quantitatively describe (characterize) pre-clustered cellular niches / cellular neighborhoods from spatial omics data. Use this whenever a user has ALREADY assigned niche / neighborhood / spatial-domain labels (e.g. from Schürch-style kNN clustering, BANKSY, CytoCommunity, GASTON, Seurat, etc.) and now wants a standardized QC / description report covering how broadly each niche appears across samples, how stable its composition is across samples, how diverse its internal cell-type makeup is, and whether it is spatially clustered within the tissue. Trigger this even when the user only says things like "describe my niches", "QC my neighborhoods", "are my niches reproducible / sample-specific", "how pure is each niche", "is niche X spatially clustered", or hands over spatial data + coordinates + niche labels + sample IDs — even if they don't use the word "niche" explicitly. High-resolution platforms (CosMx, Xenium, MERFISH) supply a cell×gene matrix plus a cell-type annotation column; low-resolution platforms (Visium, SlideSeq) supply a spot×gene matrix plus a spot×cell deconvolution proportion matrix. This skill does NOT discover or cluster niches (that is upstream) and does NOT interpret biological function (that is downstream); it produces the quantitative description that feeds those steps.
 ---
 
 # Niche Description (single-niche characterization)
@@ -26,18 +26,40 @@ If a request is for discovery, inter-niche relationships, or functional annotati
 
 ---
 
-## Required inputs (always four files)
+## Required inputs
 
-Regardless of platform, this skill needs **four files**, joined by a shared cell/spot ID:
+The required files differ by platform resolution. All files are joined on a **shared cell/spot ID** — never assume row order (see Pitfall 2).
+
+### High-resolution platforms (CosMx, Xenium, MERFISH, Stereo-seq at cell level, …) — **five files**
 
 | # | File | Contents |
 |---|---|---|
-| 1 | **expression / composition matrix** | cell×gene or spot×gene. **If a low-resolution platform using deconvolution** → instead a spot×cell-type proportion matrix (each row sums to ~1). |
-| 2 | **coordinates** | x, y per cell/spot |
-| 3 | **niche labels** | one cluster label per cell/spot (single column) |
-| 4 | **sample IDs** | which sample/slice each cell/spot belongs to |
+| 1 | **cell×gene matrix** | Expression counts, one row per cell |
+| 2 | **cell-type annotation** | A single column of cell-type labels, one entry per cell (e.g. an `.obs` column `"cell_type"`). This is the composition axis for dims 2–3. |
+| 3 | **coordinates** | x, y per cell |
+| 4 | **niche labels** | One cluster label per cell (single column) |
+| 5 | **sample IDs** | Which sample/slice each cell belongs to |
 
-The "cell-type" axis used by dimensions 2 and 3 comes from a **cell-type annotation**. Where that annotation lives depends on the platform branch below. Never assume the four files share row order — they are joined by **ID** (see Pitfall 2).
+> The cell×gene matrix (file 1) is used for validation, QC, and any expression-level diagnostics. Cell-type composition for dims 2–3 is derived **directly from the cell-type annotation column** (file 2), not from the expression matrix. If a cell-type annotation column is absent, dims 2–3 cannot run — see Branch C below.
+
+### Low-resolution platforms (Visium, Visium HD, SlideSeq, …) — **five files**
+
+| # | File | Contents |
+|---|---|---|
+| 1 | **spot×gene matrix** | Expression counts, one row per spot |
+| 2 | **spot×cell proportion matrix** | Deconvolution output — one row per spot, one column per cell type, each row sums to ≈ 1. This is the composition axis for dims 2–3. |
+| 3 | **coordinates** | x, y per spot |
+| 4 | **niche labels** | One cluster label per spot (single column) |
+| 5 | **sample IDs** | Which sample/slice each spot belongs to |
+
+> Do **not** argmax the spot×cell matrix to a single "dominant" cell type before computing dims 2–3 — that discards the proportional information you were given.
+
+**Summary of the composition axis by platform:**
+
+| Platform | Composition axis for dims 2–3 |
+|---|---|
+| High-resolution | Cell-type annotation column (one label per cell) |
+| Low-resolution | spot×cell proportion matrix (continuous proportions per spot) |
 
 ---
 
@@ -49,12 +71,12 @@ Do **not** skip this step because the user "just wants results fast." A wrong co
 
 | Must clarify | Why it matters | Notes |
 |---|---|---|
-| **Resolution: single-cell vs spot-based?** | Picks the branch below; changes how composition (dims 2–3) is built | e.g. CosMx/Xenium/MERFISH = single-cell; Visium/Visium HD = spot |
-| **(spot only) deconvolution proportions vs molecular matrix?** | Proportions → use directly as composition. Molecular matrix → composition must be derived first | See branch B vs C |
+| **Resolution: single-cell vs spot-based?** | Picks the branch below; determines which file provides the composition axis | e.g. CosMx/Xenium/MERFISH = high-resolution; Visium/Visium HD = low-resolution |
+| **(high-res) Is a cell-type annotation column present?** | Required for dims 2–3; its absence forces Branch C | e.g. `.obs["cell_type"]`. Ask where it lives if not obvious |
+| **(low-res) Is a spot×cell proportion matrix present?** | Required for dims 2–3; absence forces Branch C | Must have one column per cell type, rows summing to ≈ 1 |
 | **Coordinate unit: physical (µm) or pixels?** | The Join Count graph is built on physical distance; wrong unit ⇒ wrong neighbors | Must confirm; do not guess. See `references/platform_notes.md` |
 | **Spatial graph definition: kNN (k=?), fixed radius (r=? µm), or Delaunay?** | Directly sets the **spatial scale** of the clustering test | Regular spot arrays → grid/6-neighbor; imaging single-cell → radius or kNN. squidpy's 6-NN default is not always right |
 | **Multi-sample / multi-slice?** | Determines per-sample handling | Slices have independent coordinate systems — see Pitfall 1 |
-| **Where is the cell-type annotation?** | Basis for composition & stability dims | An existing `.obs` column? A proportion matrix? Or must it be inferred from expression? No annotation ⇒ dims 2–3 can't run |
 | **Minimum niche size** | Tiny niche×sample groups give noise | Default: drop any niche×sample group with < **20** cells/spots (tunable) |
 
 ---
@@ -63,17 +85,19 @@ Do **not** skip this step because the user "just wants results fast." A wrong co
 
 The four dimensions are the same; only how the **composition vector** (the cell-type-proportion vector used by dims 2 and 3) is built differs.
 
-**Branch A — Single-cell platform (CosMx, Xenium, MERFISH, Stereo-seq at cell level…)**
-Use the **cell-level annotation** directly. Composition of a niche (globally or within a sample) = the frequency distribution over cell types of the cells assigned to that niche.
+**Branch A — High-resolution platform (CosMx, Xenium, MERFISH, Stereo-seq at cell level, …)**
+The composition axis comes from the **cell-type annotation column** (one label per cell, e.g. `obs["cell_type"]`). Composition of a niche (globally or within a sample) = the frequency distribution over cell types of the cells assigned to that niche. The cell×gene matrix is used for QC and validation but is **not** the source of composition.
 
-**Branch B — Spot platform WITH deconvolution proportions**
-Each spot already carries a cell-type proportion vector. A niche's composition = the (size-weighted) mean proportion vector over its spots. Do **not** argmax spots to a single type before averaging — that throws away the proportions you were given.
+**Branch B — Low-resolution platform WITH a spot×cell proportion matrix (Visium, SlideSeq, …)**
+Each spot carries a deconvolution-derived cell-type proportion vector. A niche's composition = the (size-weighted) mean proportion vector over its member spots. Do **not** argmax spots to a single dominant type before averaging — that discards the proportional information you were given. The spot×gene matrix is used for QC and validation but composition comes entirely from the proportion matrix.
 
-**Branch C — Spot platform WITH molecular (gene) matrix only, no proportions**
+**Branch C — Low-resolution platform WITHOUT a proportion matrix (spot×gene only, no deconvolution)**
 There is no cell-type axis yet. You **cannot** compute dims 2–3 honestly without one. Options, in order of preference — confirm with the user:
-1. They supply/point to a deconvolution result (→ becomes Branch B), or
+1. They supply or point to a deconvolution result (→ becomes Branch B), or
 2. They accept a clearly-labeled proxy composition (e.g. over marker-gene signature scores or a coarse expression clustering), reported as a proxy, not as cell types.
 Until a cell-type (or explicitly-labeled proxy) axis exists, run only dims 1 and 4 and say why 2–3 are deferred.
+
+> **Note:** A high-resolution platform without a cell-type annotation column is effectively the same situation as Branch C — run dims 1 and 4 only and ask the user to supply annotation.
 
 Dimensions 1 (prevalence) and 4 (spatial clustering) are **platform-agnostic** — they need only labels, sample IDs, and coordinates.
 
@@ -87,9 +111,9 @@ These three are the highest-frequency, highest-damage agent errors. Treat them a
 
 Every slice/sample has its **own coordinate system**. Stacking multiple samples' (x, y) into one graph creates fake adjacencies between cells that are physically in different tissues. **All spatial computation (the Join Count test in dim 4) must be run per-sample and then aggregated.** Never connect edges across sample boundaries.
 
-### RULE 2 — JOIN THE FOUR FILES BY ID. NEVER ASSUME ROW ORDER.
+### RULE 2 — JOIN THE FIVE FILES BY ID. NEVER ASSUME ROW ORDER.
 
-The expression matrix, coordinates, niche labels, and sample IDs must be aligned on a **shared cell/spot ID**, not concatenated by position. A naive `pd.concat` on mismatched orders silently misassigns every label. The loader must inner-join on ID and **report how many rows were dropped** for non-matching.
+All five input files must be aligned on a **shared cell/spot ID**, not concatenated by position. A naive `pd.concat` on mismatched orders silently misassigns every label. The loader must inner-join on ID and **report how many rows were dropped** for non-matching.
 
 ### RULE 3 — NICHE LABELS ARE CATEGORICAL. NEVER TREAT THEM AS CONTINUOUS.
 
@@ -99,15 +123,19 @@ Niche labels are unordered categories ("niche 3" is not greater than "niche 1").
 
 ## STEP 3 — Other prep, in `validate_and_load.py`
 
-The loader (`scripts/validate_and_load.py`) is the most important script and must run first. It produces one clean AnnData (coordinates in `.obsm['spatial']`, niche label and sample ID in `.obs`) that every downstream script consumes. It must:
+The loader (`scripts/validate_and_load.py`) is the most important script and must run first. It produces one clean AnnData (expression matrix in `.X`, coordinates in `.obsm['spatial']`, cell-type annotation and niche label and sample ID in `.obs`) that every downstream script consumes. It must:
 
-- Inner-join the four files on ID; report dropped-row counts (Rule 2).
+- Inner-join **all five files** on ID; report dropped-row counts for each join (Rule 2).
+  - For high-resolution platforms: join expression matrix, cell-type annotation column, coordinates, niche labels, and sample IDs.
+  - For low-resolution platforms: join spot×gene matrix, spot×cell proportion matrix, coordinates, niche labels, and sample IDs. Store the proportion matrix in `.obsm['cell_proportions']`.
 - **Drop "unassigned" niche labels** (`-1`, `NA`, `"unassigned"`, `""`, etc.) — these are not a real niche. Confirm the sentinel value with the user if ambiguous.
 - Clean coordinates: drop/flag NaNs, exact duplicate coordinates, and obvious outliers that would distort graph construction.
 - Apply the **minimum niche size** filter (default 20 per niche×sample group); report what was filtered.
 - Normalize composition to proportions *per group* before any prevalence/diversity math (Pitfall 5).
+  - High-res: compute per-group cell-type frequencies from the annotation column.
+  - Low-res: use the proportion matrix directly; verify rows sum to ≈ 1 (warn if any row deviates by > 0.01).
 - **Fix a random seed** and record it (Pitfall 9).
-- Write a `run_config.json` capturing every parameter, the seed, package versions, and all drop/filter counts.
+- Write a `run_config.json` capturing every parameter, the seed, package versions, platform branch, and all drop/filter counts.
 
 ---
 
@@ -178,12 +206,12 @@ The **Input parameters** and **Methods & limitations** sections are mandatory �
 ## Pitfalls checklist (verify against this before reporting)
 
 1. **Cross-sample graph** — graphs built per sample, never pooled (Rule 1). ⚠️ most damaging
-2. **Row-order join** — four files joined by ID with drop report, never `concat` by position (Rule 2).
+2. **Row-order join** — five files joined by ID with drop report, never `concat` by position (Rule 2).
 3. **Categorical-as-continuous** — niche labels binarized for dim 4, never fed to Moran's I/Geary's C/G (Rule 3).
 4. **No min-size filter** — tiny niche×sample groups excluded before stability/diversity.
 5. **Un-normalized counts** — Gini/Top-5%/diversity on proportions, not raw counts.
 6. **Dirty coordinates** — NaN / duplicate / outlier coordinates handled before graph build.
-7. **(Branch C) all genes, no axis** — don't compute composition dims off raw genes without a cell-type or clearly-labeled proxy axis; select HVGs / use a defined signature if a proxy is unavoidable.
+7. **(Branch C) no composition axis** — don't compute dims 2–3 off raw genes without a cell-type annotation (high-res) or proportion matrix (low-res); use a clearly-labeled proxy only if the user agrees, and label it as such throughout the report.
 8. **Unassigned label** — `-1` / `NA` / `"unassigned"` excluded, not described as a niche.
 9. **No seed** — random seed fixed and recorded; permutation tests reproducible.
 10. **No multiple-testing correction** — BH/FDR applied across the niche × test grid before claiming significance.
@@ -196,10 +224,10 @@ The **Input parameters** and **Methods & limitations** sections are mandatory �
 
 | Script | Reads | Writes | Notes |
 |---|---|---|---|
-| `validate.py` | 4 raw files | `clean_data.h5ad`, `composition.csv`, `run_config.json` | **Run first.** All others depend on this. |
+| `validate.py` | 5 raw files | `clean_data.h5ad`, `composition.csv`, `run_config.json` | **Run first.** All others depend on this. High-res: cell-type annotation column → `composition.csv`. Low-res: spot×cell proportion matrix → stored in `.obsm['cell_proportions']` and also exported as `composition.csv`. |
 | `dim1_prevalence.py` | `clean_data.h5ad` | `dim1_prevalence.csv` | Platform-agnostic |
-| `dim2_stability.py` | `clean_data.h5ad` + `composition.csv` | `dim2_stability.csv` | Branch A/B only; exits clearly if composition.csv absent |
-| `dim3_diversity.py` | `clean_data.h5ad` + `composition.csv` | `dim3_diversity.csv` | Branch A/B only; exits clearly if composition.csv absent |
+| `dim2_stability.py` | `clean_data.h5ad` + `composition.csv` | `dim2_stability.csv` | Branch A/B only; exits clearly if `composition.csv` absent |
+| `dim3_diversity.py` | `clean_data.h5ad` + `composition.csv` | `dim3_diversity.csv` | Branch A/B only; exits clearly if `composition.csv` absent |
 | `dim4_spatial_clustering.py` | `clean_data.h5ad` | `dim4_spatial_clustering.csv` + `dim4_spatial_clustering_detail.csv` | Graph building + Join Count + FDR all in one script; platform-agnostic |
 
 After all four dimension scripts run, the agent reads the four CSVs directly to assemble the report — no separate assembly script is needed.

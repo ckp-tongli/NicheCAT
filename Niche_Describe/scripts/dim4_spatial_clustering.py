@@ -1,279 +1,500 @@
 #!/usr/bin/env python3
 """
-dim4_spatial_clustering.py  —  Dimension 4: Single-niche spatial clustering
-═════════════════════════════════════════════════════════════════════════════
-Is each niche spatially clustered within tissue, or randomly scattered?
+dim4_spatial_clustering.py — Dimension 4: Single-Niche Spatial Clustering
+==========================================================================
+Is each niche spatially clumped within tissue, or scattered?
 
-Method: binarized Join Count statistic with permutation test + BH/FDR correction.
+Reads
+-----
+  clean_data.h5ad     (produced by validate.py)
 
-Algorithm per niche per sample
-  1. Binarize: cells of target niche = 1, all other cells = 0.
-  2. Build per-sample spatial graph (kNN or radius).
-  3. Count observed 1–1 (BB) joins in the graph.
-  4. Permute binary labels n_perm times; count BB joins each time.
-  5. One-sided p-value = (# perms with BB ≥ observed + 1) / (n_perm + 1).
-  6. Aggregate per-niche: median z-score, # samples significant after BH correction.
+Writes
+------
+  dim4_spatial_clustering.csv          One row per niche (aggregated summary)
+  dim4_spatial_clustering_detail.csv   One row per niche × sample (raw results)
 
-RULE 1: graphs are ALWAYS built per-sample independently.
-        Never pool cells from multiple samples into one graph.
-RULE 3: niche labels are CATEGORICAL. They are binarized here.
-        Do NOT feed raw niche IDs to Moran's I / Geary's C / Getis-Ord G.
+Method (per niche, per sample — RULE 1: NEVER pool samples)
+-----------------------------------------------------------
+  1. Binarize: cells in the target niche → 1; all other cells in the sample → 0.
+     Niche labels are CATEGORICAL; this script never feeds them into Moran's I /
+     Geary's C / Getis-Ord G (Rule 3 — those tests require a continuous variable).
 
-No external spatial-stats libraries required (only scipy + numpy + statsmodels).
+  2. Build a symmetric spatial graph using one of three methods:
+       knn      k nearest neighbours (default: k=6)
+       radius   fixed radius in coordinate units
+       delaunay Delaunay triangulation (good for irregular single-cell layouts)
+     Implemented with scipy.spatial.cKDTree / scipy.spatial.Delaunay —
+     no squidpy, esda, or libpysal required.
+
+  3. Count observed BB (1–1) join count = Σ_{(i,j)∈E} yᵢ · yⱼ
+
+  4. Permutation test (n_permutations=999 by default; seed from validate.py):
+     Randomly shuffle the binary y vector n times (preserving total count),
+     compute BB joins each time, derive p-value as:
+         p = (# permutations with BB_perm ≥ BB_obs + 1) / (n_permutations + 1)
+     One-sided test (we test for clustering, not dispersion).
+
+  5. BH/FDR correction across the FULL niche × sample test grid.
+
+  6. Aggregate per-sample results to a per-niche summary:
+       fraction_samples_clustered = # significant samples / # tested samples
+       spatial_clustering_label   = 'clustered' if ≥ 50% samples are significant
 
 Usage
-  python dim4_spatial_clustering.py --data niche_output/clean_data.h5ad \\
-         [--graph-method knn|radius] [--knn-k 6] [--radius 100] \\
-         [--n-perm 999] [--fdr-alpha 0.05] [--seed 42] [--out-dir niche_output]
+-----
+  python dim4_spatial_clustering.py --indir results/ --outdir results/
+  python dim4_spatial_clustering.py --indir results/ --graph-type radius --radius 50
+  python dim4_spatial_clustering.py --indir results/ --graph-type delaunay
 
-Outputs
-  {out_dir}/dim4_spatial_clustering.csv          — per-niche summary
-  {out_dir}/dim4_spatial_clustering_detail.csv   — per-niche × per-sample raw results
+Run after validate.py.
 """
-import argparse, sys
+
+import argparse
+import logging
+import sys
+from itertools import combinations
 from pathlib import Path
+
+import anndata as ad
 import numpy as np
 import pandas as pd
-import scipy.sparse as sp
-from scipy.spatial import cKDTree
+from scipy.spatial import Delaunay, cKDTree
+from statsmodels.stats.multitest import multipletests
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
 
 
-def _install(pkg):
-    import subprocess
-    subprocess.check_call(
-        [sys.executable, "-m", "pip", "install", pkg, "--break-system-packages", "-q"]
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────────────────────────────────────
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Dimension 4 — Single-niche spatial clustering (Join Count + permutation).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    p.add_argument("--indir", default=".",
+                   help="Directory containing clean_data.h5ad (default: .)")
+    p.add_argument("--outdir", default=None,
+                   help="Output directory (default: same as --indir)")
+    p.add_argument(
+        "--graph-type", choices=["knn", "radius", "delaunay"], default="knn",
+        help="Spatial graph construction method (default: knn)",
+    )
+    p.add_argument(
+        "--k", type=int, default=6,
+        help="Number of nearest neighbours for kNN graph (default: 6, "
+             "the standard 6-neighbour hexagonal grid default)",
+    )
+    p.add_argument(
+        "--radius", type=float, default=None,
+        help="Fixed search radius in coordinate units (required when "
+             "--graph-type=radius)",
+    )
+    p.add_argument(
+        "--n-permutations", type=int, default=999,
+        help="Number of permutations for the Join Count p-value (default: 999)",
+    )
+    p.add_argument(
+        "--fdr-alpha", type=float, default=0.05,
+        help="FDR significance threshold for BH correction (default: 0.05)",
+    )
+    p.add_argument(
+        "--clustered-fraction", type=float, default=0.50,
+        help="Fraction of samples that must be significant for a niche to be "
+             "labelled 'clustered' in the summary (default: 0.50)",
+    )
+    p.add_argument(
+        "--seed", type=int, default=None,
+        help="Random seed override (default: use seed stored in clean_data.h5ad)",
+    )
+    return p.parse_args()
 
 
-# ── Graph builders (scipy only, no libpysal / esda needed) ────────────────────
-
-def _knn_graph(coords: np.ndarray, k: int) -> sp.csr_matrix:
-    """Symmetric, binary kNN adjacency matrix."""
+# ──────────────────────────────────────────────────────────────────────────────
+# Spatial graph builders
+# ──────────────────────────────────────────────────────────────────────────────
+def build_knn_graph(coords: np.ndarray, k: int) -> list[tuple[int, int]]:
+    """Symmetric kNN graph. Each node connects to its k nearest neighbours."""
     n = len(coords)
-    k = min(k, n - 1)
+    k_actual = min(k + 1, n)   # +1 because query returns self as rank-0 hit
     tree = cKDTree(coords)
-    _, idx = tree.query(coords, k=k + 1)      # +1: first neighbour is self
-    rows, cols = [], []
-    for i, neighbours in enumerate(idx[:, 1:]):  # skip self (col 0)
-        rows.extend([i] * len(neighbours) + list(neighbours))
-        cols.extend(list(neighbours) + [i] * len(neighbours))
-    data = np.ones(len(rows), dtype=np.float32)
-    adj  = sp.csr_matrix((data, (rows, cols)), shape=(n, n))
-    adj.data[:] = 1                           # binarize duplicate edges
-    return adj
+    _, idxs = tree.query(coords, k=k_actual)
+    edges: set[tuple[int, int]] = set()
+    for i, nbrs in enumerate(idxs):
+        for j in nbrs:
+            if j != i:
+                edges.add((min(int(i), int(j)), max(int(i), int(j))))
+    return list(edges)
 
 
-def _radius_graph(coords: np.ndarray, radius: float) -> sp.csr_matrix:
-    """Radius-based binary adjacency matrix."""
-    n    = len(coords)
+def build_radius_graph(coords: np.ndarray, radius: float) -> list[tuple[int, int]]:
+    """Symmetric radius graph. Edges connect all pairs within `radius`."""
     tree = cKDTree(coords)
-    pairs = tree.query_pairs(radius, output_type="ndarray")
-    if len(pairs) == 0:
-        return sp.csr_matrix((n, n), dtype=np.float32)
-    rows = np.concatenate([pairs[:, 0], pairs[:, 1]])
-    cols = np.concatenate([pairs[:, 1], pairs[:, 0]])
-    data = np.ones(len(rows), dtype=np.float32)
-    adj  = sp.csr_matrix((data, (rows, cols)), shape=(n, n))
-    adj.data[:] = 1
-    return adj
+    pairs = tree.query_pairs(r=radius)
+    return [(min(int(a), int(b)), max(int(a), int(b))) for a, b in pairs]
 
 
-# ── Join Count test ────────────────────────────────────────────────────────────
+def build_delaunay_graph(coords: np.ndarray) -> list[tuple[int, int]]:
+    """
+    Delaunay triangulation graph.
+    Falls back to kNN-6 for degenerate configurations (< 3 points, collinear).
+    """
+    if len(coords) < 3:
+        return []
+    try:
+        tri = Delaunay(coords)
+        edges: set[tuple[int, int]] = set()
+        for simplex in tri.simplices:
+            for a, b in combinations(simplex, 2):
+                edges.add((min(int(a), int(b)), max(int(a), int(b))))
+        return list(edges)
+    except Exception as exc:
+        log.warning(
+            "    Delaunay triangulation failed (%s). Falling back to kNN-6.", exc
+        )
+        return build_knn_graph(coords, k=6)
 
-def _count_bb(z: np.ndarray, adj: sp.csr_matrix) -> int:
-    """Count 1–1 (BB) joins in the upper triangle of the adjacency matrix."""
-    rows, cols = adj.nonzero()
-    upper = rows < cols                       # avoid double-counting
-    return int(((z[rows[upper]] == 1) & (z[cols[upper]] == 1)).sum())
+
+def build_graph(
+    coords: np.ndarray,
+    graph_type: str,
+    k: int = 6,
+    radius: Optional[float] = None,
+) -> list[tuple[int, int]]:
+    """Dispatch to the correct graph builder."""
+    if graph_type == "knn":
+        return build_knn_graph(coords, k)
+    elif graph_type == "radius":
+        if radius is None:
+            raise ValueError("radius must be set when graph_type='radius'")
+        return build_radius_graph(coords, radius)
+    elif graph_type == "delaunay":
+        return build_delaunay_graph(coords)
+    else:
+        raise ValueError(f"Unknown graph_type: {graph_type!r}")
 
 
-def _join_count_test(
-    z: np.ndarray,
-    adj: sp.csr_matrix,
-    n_perm: int,
+# ──────────────────────────────────────────────────────────────────────────────
+# Join Count statistic
+# ──────────────────────────────────────────────────────────────────────────────
+def count_bb_joins(y: np.ndarray, edge_a: np.ndarray, edge_b: np.ndarray) -> int:
+    """
+    Count BB (1–1) join count statistic.
+
+    y      : binary array of length n_cells (1 = target niche, 0 = other).
+    edge_a : array of first endpoints (local integer index).
+    edge_b : array of second endpoints (local integer index).
+    Both endpoint arrays are pre-computed from the edge list for speed.
+    """
+    return int(np.sum(y[edge_a] * y[edge_b]))
+
+
+def run_permutation_test(
+    y: np.ndarray,
+    edge_a: np.ndarray,
+    edge_b: np.ndarray,
+    n_perms: int,
     rng: np.random.Generator,
-) -> tuple:
+) -> tuple[int, float, float]:
     """
-    Permutation-based Join Count test for spatial clustering of binary z.
-    Returns (obs_bb, mean_perm_bb, z_score, p_val_one_sided).
-    p_val uses continuity correction: (# perms ≥ obs + 1) / (n_perm + 1).
+    Permutation test for the BB join count.
+
+    Returns
+    -------
+    jc_obs   : observed BB join count
+    z_score  : (jc_obs − mean_perm) / std_perm   (NaN if std_perm = 0)
+    p_value  : (# perms with BB_perm ≥ jc_obs + 1) / (n_perms + 1)
+               One-sided, testing for clustering (excess same-label joins).
     """
-    z    = np.asarray(z, dtype=int)
-    obs  = _count_bb(z, adj)
-    perm = np.array([_count_bb(rng.permutation(z), adj) for _ in range(n_perm)])
-    mu   = float(perm.mean())
-    sigma = float(perm.std()) + 1e-10
-    z_score = (obs - mu) / sigma
-    p_val   = (float((perm >= obs).sum()) + 1.0) / (n_perm + 1.0)
-    return obs, mu, round(z_score, 4), round(p_val, 6)
+    jc_obs = count_bb_joins(y, edge_a, edge_b)
+
+    if len(edge_a) == 0:
+        return jc_obs, np.nan, np.nan
+
+    # Permute labels (preserves marginal sum of y)
+    y_perm = y.copy()
+    perm_jc = np.empty(n_perms, dtype=float)
+    for i in range(n_perms):
+        rng.shuffle(y_perm)
+        perm_jc[i] = count_bb_joins(y_perm, edge_a, edge_b)
+
+    mu = perm_jc.mean()
+    sigma = perm_jc.std()
+    z = float((jc_obs - mu) / sigma) if sigma > 0 else np.nan
+
+    # One-sided p-value: proportion of permutations ≥ observed
+    p = float((perm_jc >= jc_obs).sum() + 1) / (n_perms + 1)
+
+    return jc_obs, z, p
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Optional type hint helper (Python 3.9 compatibility)
+# ──────────────────────────────────────────────────────────────────────────────
+try:
+    from typing import Optional
+except ImportError:
+    Optional = None  # type: ignore
 
-def main():
-    ap = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    ap.add_argument("--data",         required=True,  help="clean_data.h5ad from validate.py")
-    ap.add_argument("--graph-method", default="knn",  choices=["knn", "radius"],
-                    help="Spatial graph type: knn or radius (default: knn)")
-    ap.add_argument("--knn-k",  type=int,   default=6,     help="k for kNN graph (default: 6)")
-    ap.add_argument("--radius", type=float, default=100.0,
-                    help="Radius for radius graph in coordinate units (default: 100). "
-                         "Confirm unit with validate.py / references/platform_notes.md")
-    ap.add_argument("--n-perm",    type=int,   default=999,  help="Permutations per test (default: 999)")
-    ap.add_argument("--fdr-alpha", type=float, default=0.05, help="BH-FDR significance threshold (default: 0.05)")
-    ap.add_argument("--seed",      type=int,   default=None,
-                    help="Random seed (default: inherits seed from run_config.json)")
-    ap.add_argument("--out-dir", default=None, help="Output directory (default: same folder as --data)")
-    args = ap.parse_args()
 
-    try:
-        import anndata as ad
-    except ImportError:
-        print("[dim4] Installing anndata..."); _install("anndata"); import anndata as ad
-    try:
-        from statsmodels.stats.multitest import multipletests
-    except ImportError:
-        print("[dim4] Installing statsmodels..."); _install("statsmodels")
-        from statsmodels.stats.multitest import multipletests
+# ──────────────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────────────
+def main() -> None:
+    args = parse_args()
+    indir = Path(args.indir)
+    outdir = Path(args.outdir) if args.outdir else indir
+    outdir.mkdir(parents=True, exist_ok=True)
 
-    data_path = Path(args.data)
-    out = Path(args.out_dir) if args.out_dir else data_path.parent
-    out.mkdir(parents=True, exist_ok=True)
+    # ── Validate CLI ──────────────────────────────────────────────────────────
+    if args.graph_type == "radius" and args.radius is None:
+        log.error("--radius must be provided when --graph-type=radius.")
+        sys.exit(1)
 
-    print("=" * 60)
-    print("dim4_spatial_clustering.py  —  Single-niche spatial clustering")
-    print("=" * 60)
+    # ── Load AnnData ──────────────────────────────────────────────────────────
+    h5ad_path = indir / "clean_data.h5ad"
+    if not h5ad_path.exists():
+        log.error(
+            "clean_data.h5ad not found in %s. Run validate.py first.", indir
+        )
+        sys.exit(1)
 
-    adata = ad.read_h5ad(data_path)
-    obs   = adata.obs[["niche", "sample"]].copy()
-    coords_all = adata.obsm["spatial"]        # shape (n_cells, 2)
+    log.info("Loading %s", h5ad_path)
+    adata = ad.read_h5ad(h5ad_path)
 
-    # Seed: prefer explicit --seed, then fall back to run_config
-    seed = args.seed
-    if seed is None:
-        seed = adata.uns.get("run_config", {}).get("seed", 42)
+    # Resolve random seed
+    stored_seed = adata.uns.get("seed", 42)
+    seed = args.seed if args.seed is not None else stored_seed
     rng = np.random.default_rng(seed)
+    log.info("  Random seed: %d  (source: %s)",
+             seed, "CLI --seed" if args.seed is not None else "clean_data.h5ad")
 
-    all_niches  = sorted(obs["niche"].unique())
-    all_samples = sorted(obs["sample"].unique())
+    obs = adata.obs[["niche", "sample"]].copy()
+    coords_all: np.ndarray = adata.obsm["spatial"]   # (n_cells, 2), aligned with obs
 
-    print(f"\n  Graph:       {args.graph_method}  "
-          f"(k={args.knn_k})" if args.graph_method == "knn" else
-          f"\n  Graph:       {args.graph_method}  (radius={args.radius})")
-    print(f"  Permutations: {args.n_perm}  |  FDR α: {args.fdr_alpha}  |  Seed: {seed}")
-    print(f"  {len(all_niches)} niches  ×  {len(all_samples)} samples")
-    print("\n  RULE 1 in effect: one graph per sample, never pooled across samples.")
-    print("  RULE 3 in effect: niche labels binarized (target=1, other=0); "
-          "NOT fed as continuous values.\n")
+    niches = sorted(obs["niche"].unique())
+    samples = sorted(obs["sample"].unique())
+    log.info("  %d niches | %d samples", len(niches), len(samples))
+    log.info(
+        "  Graph: %s%s  |  Permutations: %d  |  FDR α: %.2f",
+        args.graph_type,
+        f"  k={args.k}" if args.graph_type == "knn"
+        else f"  r={args.radius}" if args.graph_type == "radius"
+        else "",
+        args.n_permutations,
+        args.fdr_alpha,
+    )
 
-    # ── Per-niche × per-sample tests ──────────────────────────────────────────
-    raw_rows = []
+    # ── Pre-build one graph per sample (Rule 1 — NEVER pool samples) ──────────
+    # Building the graph depends only on the sample's coordinates, not on the
+    # niche being tested — so we reuse the same graph for all niches in a sample.
+    log.info("Pre-building spatial graphs (one per sample)…")
+    sample_graph_cache: dict = {}
 
-    for sample in all_samples:
-        s_mask = (obs["sample"] == sample).values
-        s_idx  = np.where(s_mask)[0]
-        if len(s_idx) < 5:
-            print(f"  SKIP sample '{sample}': only {len(s_idx)} cells (< 5).")
+    for sample in samples:
+        sample_bool = (obs["sample"] == sample).values        # boolean mask over obs
+        n_sample = int(sample_bool.sum())
+
+        if n_sample < 3:
+            log.warning(
+                "  Sample %-15s has only %d cells/spots — skipping (need ≥ 3).",
+                sample, n_sample,
+            )
             continue
 
-        s_coords  = coords_all[s_idx]
-        s_niches  = obs["niche"].values[s_idx]
+        s_coords = coords_all[sample_bool]                    # local coords (0-indexed)
+        edges = build_graph(s_coords, args.graph_type, k=args.k, radius=args.radius)
 
-        # Build graph ONCE per sample (shared across all niches in this sample)
-        if args.graph_method == "knn":
-            adj = _knn_graph(s_coords, args.knn_k)
-        else:
-            adj = _radius_graph(s_coords, args.radius)
-
-        if adj.nnz == 0:
-            print(f"  WARNING: empty graph for sample '{sample}'. "
-                  "Try increasing --knn-k or --radius, or check coordinate units.")
+        if not edges:
+            log.warning(
+                "  Sample %-15s: graph has 0 edges — skipping.", sample
+            )
             continue
 
-        for niche in all_niches:
-            z          = (s_niches == niche).astype(int)
-            n_in_sample = int(z.sum())
-            n_total     = len(z)
+        ea = np.array([e[0] for e in edges], dtype=np.intp)
+        eb = np.array([e[1] for e in edges], dtype=np.intp)
 
-            if n_in_sample == 0:
-                continue                      # niche absent in this sample
+        # Store binary niche membership for efficient lookup
+        sample_niche_arr = obs["niche"].values[sample_bool]   # niche label per cell
 
-            if n_in_sample == n_total:        # entire sample is this niche
-                raw_rows.append({
-                    "niche": niche, "sample": sample,
-                    "n_niche": n_in_sample, "n_total": n_total,
-                    "obs_bb": int(adj.nnz // 2), "exp_bb": float("nan"),
-                    "z_score": float("nan"),    "p_raw": float("nan"),
-                    "note": "all cells are this niche — test inapplicable",
-                })
+        sample_graph_cache[sample] = {
+            "bool_mask": sample_bool,
+            "niche_arr": sample_niche_arr,
+            "n": n_sample,
+            "n_edges": len(edges),
+            "edge_a": ea,
+            "edge_b": eb,
+        }
+
+    log.info(
+        "  Graphs built for %d / %d samples.", len(sample_graph_cache), len(samples)
+    )
+
+    # ── Run Join Count test: per niche × per sample ────────────────────────────
+    log.info("Running Join Count permutation tests…")
+    detail_rows: list[dict] = []
+
+    for niche_i, niche in enumerate(niches):
+        log.info(
+            "  [%d/%d] Niche: %s", niche_i + 1, len(niches), niche
+        )
+
+        for sample, sg in sample_graph_cache.items():
+            y = (sg["niche_arr"] == niche).astype(np.int8)
+            n1 = int(y.sum())   # cells in this niche within this sample
+
+            base = {
+                "niche": niche,
+                "sample": sample,
+                "n_cells_in_sample": sg["n"],
+                "n_niche_cells": n1,
+                "n_edges": sg["n_edges"],
+            }
+
+            if n1 == 0:
+                # Niche absent from this sample — skip (not an error)
                 continue
 
-            obs_bb, exp_bb, z_score, p_raw = _join_count_test(z, adj, args.n_perm, rng)
-            raw_rows.append({
-                "niche": niche, "sample": sample,
-                "n_niche": n_in_sample, "n_total": n_total,
-                "obs_bb":  obs_bb,
-                "exp_bb":  round(exp_bb, 2),
-                "z_score": z_score,
-                "p_raw":   p_raw,
-                "note":    "",
-            })
+            if n1 == sg["n"]:
+                # All cells in sample belong to this niche; degenerate — trivially clustered
+                detail_rows.append(
+                    {
+                        **base,
+                        "JC_observed": sg["n_edges"],   # all joins are BB
+                        "JC_z": np.nan,
+                        "p_value_raw": np.nan,
+                        "note": "all cells in sample belong to this niche — degenerate",
+                    }
+                )
+                continue
 
-    if not raw_rows:
-        sys.exit(
-            "ERROR: no valid niche×sample tests were run.\n"
-            "  Check --min-cells in validate.py and --knn-k / --radius here."
+            jc_obs, z, p = run_permutation_test(
+                y, sg["edge_a"], sg["edge_b"], args.n_permutations, rng
+            )
+
+            detail_rows.append(
+                {
+                    **base,
+                    "JC_observed": jc_obs,
+                    "JC_z": round(z, 3) if not np.isnan(z) else np.nan,
+                    "p_value_raw": round(p, 4) if not np.isnan(p) else np.nan,
+                    "note": "",
+                }
+            )
+
+    detail_df = pd.DataFrame(detail_rows)
+
+    if detail_df.empty:
+        log.error(
+            "No valid niche×sample tests were computed. "
+            "Check that samples have ≥ 3 cells and graphs have edges."
+        )
+        sys.exit(1)
+
+    # ── BH/FDR correction across the FULL niche × sample test grid ────────────
+    # Pitfall 10: correct ALL p-values jointly, not per-niche separately.
+    valid_pval_mask = detail_df["p_value_raw"].notna()
+    n_tests = int(valid_pval_mask.sum())
+    log.info("Applying BH/FDR correction over %d tests…", n_tests)
+
+    detail_df["p_value_fdr"] = np.nan
+    if n_tests > 0:
+        pvals = detail_df.loc[valid_pval_mask, "p_value_raw"].values
+        _, pvals_fdr, _, _ = multipletests(pvals, alpha=args.fdr_alpha, method="fdr_bh")
+        detail_df.loc[valid_pval_mask, "p_value_fdr"] = np.round(pvals_fdr, 4)
+
+    detail_df["significant_fdr"] = detail_df["p_value_fdr"] < args.fdr_alpha
+
+    # Write detail CSV
+    detail_out = outdir / "dim4_spatial_clustering_detail.csv"
+    detail_df.to_csv(detail_out, index=False)
+    log.info("Written: %s  (%d rows)", detail_out, len(detail_df))
+
+    # ── Aggregate to per-niche summary ─────────────────────────────────────────
+    summary_rows: list[dict] = []
+
+    for niche, grp in detail_df.groupby("niche", sort=True):
+        tested = grp[grp["p_value_fdr"].notna()]
+        n_tested = len(tested)
+        n_sig = int(tested["significant_fdr"].sum())
+        frac_clustered = round(n_sig / n_tested, 4) if n_tested > 0 else np.nan
+        median_z = round(float(tested["JC_z"].median()), 3) \
+            if not tested["JC_z"].isna().all() else np.nan
+        mean_jc = round(float(tested["JC_observed"].mean()), 2) \
+            if not tested["JC_observed"].isna().all() else np.nan
+
+        spatial_label = (
+            "clustered"
+            if n_tested > 0 and frac_clustered >= args.clustered_fraction
+            else "scattered"
+            if n_tested > 0
+            else "undetermined"
         )
 
-    raw_df = pd.DataFrame(raw_rows)
+        reading = (
+            f"{n_sig} / {n_tested} samples show significant BB clustering "
+            f"(FDR < {args.fdr_alpha}); "
+            f"median Z = {median_z}; "
+            f"label = {spatial_label}."
+        ) if n_tested > 0 else "No testable samples."
 
-    # ── BH/FDR correction across ALL (niche × sample) tests  (PITFALL 10) ────
-    testable = raw_df["p_raw"].notna()
-    if testable.sum() > 0:
-        _, p_bh, _, _ = multipletests(
-            raw_df.loc[testable, "p_raw"].values, alpha=args.fdr_alpha, method="fdr_bh"
+        summary_rows.append(
+            {
+                "niche": niche,
+                "n_samples_tested": n_tested,
+                "n_samples_significant": n_sig,
+                "fraction_samples_clustered": frac_clustered,
+                "median_JC_z": median_z,
+                "mean_JC_observed": mean_jc,
+                "spatial_clustering_label": spatial_label,
+                "reading": reading,
+            }
         )
-        raw_df.loc[testable, "p_bh"] = np.round(p_bh, 6)
-    raw_df.loc[~testable, "p_bh"] = float("nan")
 
-    # ── Per-niche summary ─────────────────────────────────────────────────────
-    summary_rows = []
-    for niche in all_niches:
-        sub = raw_df[raw_df["niche"] == niche]
-        ok  = sub[sub["p_raw"].notna()]        # testable rows only
-        n_tested = len(ok)
-        n_sig    = int((ok["p_bh"] < args.fdr_alpha).sum()) if n_tested > 0 else 0
+    summary_df = (
+        pd.DataFrame(summary_rows)
+        .set_index("niche")
+        .sort_values("fraction_samples_clustered", ascending=False, na_position="last")
+    )
 
-        summary_rows.append({
-            "niche":                 niche,
-            "n_samples_tested":      n_tested,
-            "n_samples_clustered":   n_sig,
-            "pct_samples_clustered": round(n_sig / n_tested, 3) if n_tested > 0 else float("nan"),
-            "median_z_score":        round(float(ok["z_score"].median()), 3) if n_tested > 0 else float("nan"),
-            "median_obs_bb":         round(float(ok["obs_bb"].median()),  1) if n_tested > 0 else float("nan"),
-            "median_exp_bb":         round(float(ok["exp_bb"].median()),  1) if n_tested > 0 else float("nan"),
-            "spatially_clustered":   n_sig > 0,
-        })
+    summary_out = outdir / "dim4_spatial_clustering.csv"
+    summary_df.to_csv(summary_out)
+    log.info("Written: %s  (%d niches)", summary_out, len(summary_df))
 
-    summary_df = pd.DataFrame(summary_rows)
-
-    # ── Write outputs ─────────────────────────────────────────────────────────
-    detail_path  = out / "dim4_spatial_clustering_detail.csv"
-    summary_path = out / "dim4_spatial_clustering.csv"
-    raw_df.to_csv(detail_path, index=False)
-    summary_df.to_csv(summary_path, index=False)
-
-    print(f"Written: {summary_path}")
-    print(f"Written: {detail_path}  (per-sample detail for audit)")
-    print("\nSummary  (BH-corrected; spatially_clustered = significant in ≥1 sample):")
-    print(summary_df.to_string(index=False))
-    print("\nInterpretation guide:")
-    print("  obs_bb > exp_bb → more same-label joins than expected by chance (clustering)")
-    print("  z_score > 0     → consistent direction of clustering")
-    print(f"  p_bh < {args.fdr_alpha}       → spatially clustered after FDR correction")
-    print("\n=== dim4_spatial_clustering.py complete ===")
+    # ── Console summary ────────────────────────────────────────────────────────
+    log.info("=" * 60)
+    log.info("Dimension 4 — Single-Niche Spatial Clustering (Join Count)")
+    log.info(
+        "  Graph: %-10s | k/r: %s | Permutations: %d | Seed: %d",
+        args.graph_type,
+        args.k if args.graph_type == "knn" else args.radius,
+        args.n_permutations,
+        seed,
+    )
+    log.info(
+        "  FDR α = %.2f  |  Clustered-fraction threshold = %.2f",
+        args.fdr_alpha, args.clustered_fraction,
+    )
+    log.info(
+        "  Clustered niches  (≥ %.0f%% samples significant): %d / %d",
+        args.clustered_fraction * 100,
+        (summary_df["spatial_clustering_label"] == "clustered").sum(),
+        len(summary_df),
+    )
+    log.info(
+        "  Scattered niches: %d",
+        (summary_df["spatial_clustering_label"] == "scattered").sum(),
+    )
+    log.info(
+        "  Undetermined (no testable samples): %d",
+        (summary_df["spatial_clustering_label"] == "undetermined").sum(),
+    )
+    log.info("=" * 60)
 
 
 if __name__ == "__main__":

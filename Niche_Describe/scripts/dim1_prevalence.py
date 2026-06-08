@@ -1,136 +1,243 @@
 #!/usr/bin/env python3
 """
-dim1_prevalence.py  —  Dimension 1: Cross-sample prevalence
-═════════════════════════════════════════════════════════════
+dim1_prevalence.py — Dimension 1: Cross-sample Prevalence
+==========================================================
 How broadly does each niche appear across samples?
 
-Metrics (all computed on NORMALIZED per-sample proportions, not raw counts):
-  SPR   Sample Prevalence Rate = #samples containing niche / #total samples
-  Gini  Gini coefficient of per-sample proportions  (0=even, 1=concentrated)
-  Conc  Top-X% concentration = % of niche cells from the top-X% richest samples
+Reads
+-----
+  clean_data.h5ad     (produced by validate.py)
 
-WARNING: Gini and Conc MUST be computed on normalized proportions
-  (niche_cells_in_sample / total_cells_in_sample), NOT raw counts.
-  Raw counts give large-sample bias: a niche present equally in every sample
-  would look falsely concentrated if sample sizes differ.
+Writes
+------
+  dim1_prevalence.csv
+
+Metrics (per niche)
+-------------------
+  SPR              Sample Prevalence Rate = # samples containing the niche
+                   / total # samples.
+                   ≥ 0.20 → ubiquitous (default threshold, tunable)
+
+  gini             Gini coefficient of the niche's NORMALIZED per-sample
+                   proportions (niche cell count ÷ that sample's total cells),
+                   computed across ALL samples (zeros included for absent samples).
+                   0 = perfectly even; ~1 = maximally concentrated.
+                   > 0.7 → highly concentrated (sample-dominant)
+
+  top5pct_share    Fraction of the niche's total cells contributed by the
+                   top-5% of samples (by niche proportion). < 0.30 → even.
+
+CRITICAL: Gini and top5pct_share are computed on NORMALIZED per-sample
+proportions, NOT raw cell counts (Pitfall 5).
 
 Usage
-  python dim1_prevalence.py --data niche_output/clean_data.h5ad \\
-         [--out-dir niche_output] [--spr-min 0.2] [--top-pct 0.05]
+-----
+  python dim1_prevalence.py --indir results/ --outdir results/
 
-Output
-  {out_dir}/dim1_prevalence.csv
+Run after validate.py.
 """
-import argparse, sys
+
+import argparse
+import logging
+import sys
 from pathlib import Path
+
+import anndata as ad
 import numpy as np
 import pandas as pd
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
 
-def _install(pkg):
-    import subprocess
-    subprocess.check_call(
-        [sys.executable, "-m", "pip", "install", pkg, "--break-system-packages", "-q"]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────────────────────────────────────
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Dimension 1 — Cross-sample prevalence (SPR / Gini / Top-5%).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    p.add_argument("--indir", default=".",
+                   help="Directory containing clean_data.h5ad (default: .)")
+    p.add_argument("--outdir", default=None,
+                   help="Output directory (default: same as --indir)")
+    p.add_argument("--spr-threshold", type=float, default=0.20,
+                   help="SPR threshold for 'ubiquitous' flag (default: 0.20)")
+    p.add_argument("--gini-threshold", type=float, default=0.70,
+                   help="Gini threshold for 'concentrated' flag (default: 0.70)")
+    p.add_argument("--top5-threshold", type=float, default=0.30,
+                   help="Top-5%% concentration threshold for 'concentrated' flag (default: 0.30)")
+    return p.parse_args()
 
 
-def gini(values: np.ndarray) -> float:
-    """Gini coefficient of a non-negative array.  Returns NaN for all-zero input."""
-    v = np.sort(np.asarray(values, dtype=float))
-    n = len(v)
-    if n == 0 or v.sum() == 0:
-        return float("nan")
-    idx = np.arange(1, n + 1)
-    return float((2 * (idx * v).sum() / (n * v.sum())) - (n + 1) / n)
+# ──────────────────────────────────────────────────────────────────────────────
+# Statistics
+# ──────────────────────────────────────────────────────────────────────────────
+def gini_coefficient(values: np.ndarray) -> float:
+    """
+    Gini coefficient of a non-negative 1-D array (zeros included for absent
+    samples).
+
+    Formula (Lorenz-curve, rank-weighted):
+        G = (2 · Σ_{k=1}^{n} k·x_k) / (n · Σx_k)  −  (n+1)/n
+    where x_k are sorted ascending and k is the 1-based rank.
+
+    Returns NaN when the sum of values is zero (niche has no cells).
+    Range: [0, 1]; 0 = perfectly even; approaches 1 as concentration increases.
+    """
+    values = np.sort(np.asarray(values, dtype=float))
+    total = values.sum()
+    if total == 0.0:
+        return np.nan
+    n = len(values)
+    ranks = np.arange(1, n + 1, dtype=float)
+    return float((2.0 * np.dot(ranks, values)) / (n * total) - (n + 1.0) / n)
 
 
-def main():
-    ap = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    ap.add_argument("--data",           required=True,  help="clean_data.h5ad from validate.py")
-    ap.add_argument("--out-dir",        default=None,   help="Output directory (default: same folder as --data)")
-    ap.add_argument("--spr-min",        type=float, default=0.2,  help="SPR ≥ threshold → 'widespread' (default: 0.2)")
-    ap.add_argument("--gini-threshold", type=float, default=0.5,  help="Gini < threshold → 'even' (default: 0.5)")
-    ap.add_argument("--top-pct",        type=float, default=0.05, help="Top-X%% of samples for concentration (default: 0.05)")
-    ap.add_argument("--conc-threshold", type=float, default=0.30, help="Conc < threshold → 'even' (default: 0.30)")
-    args = ap.parse_args()
+def top_k_pct_share(per_sample_raw_counts: pd.Series, top_pct: float = 0.05) -> float:
+    """
+    Fraction of the niche's total cells contributed by the top `top_pct`
+    fraction of samples (ranked by raw count descending).
 
-    try:
-        import anndata as ad
-    except ImportError:
-        print("[dim1] Installing anndata..."); _install("anndata"); import anndata as ad
+    At minimum, 1 sample is included in the 'top-k' group (ceiling).
 
-    data_path = Path(args.data)
-    out = Path(args.out_dir) if args.out_dir else data_path.parent
-    out.mkdir(parents=True, exist_ok=True)
+    Note: we rank by raw counts but normalize the *result* to a proportion
+    of the niche's global total — the numerator is raw counts (reflecting
+    absolute contribution), the denominator is the niche's total cell count.
+    This is the standard Top-5% concentration metric.
+    """
+    k = max(1, int(np.ceil(len(per_sample_raw_counts) * top_pct)))
+    top_k_sum = per_sample_raw_counts.nlargest(k).sum()
+    total = per_sample_raw_counts.sum()
+    return float(top_k_sum / total) if total > 0 else np.nan
 
-    print("=" * 60)
-    print("dim1_prevalence.py  —  Cross-sample prevalence")
-    print("=" * 60)
 
-    adata = ad.read_h5ad(data_path)
-    obs   = adata.obs[["niche", "sample"]].copy()
-
-    all_niches    = sorted(obs["niche"].unique())
-    all_samples   = sorted(obs["sample"].unique())
-    total_samples = len(all_samples)
-    sample_totals = obs.groupby("sample").size()  # total cells per sample
-
-    print(f"\n  {len(all_niches)} niches × {total_samples} samples")
-    print(f"  [NOTE] Gini and Top-{int(args.top_pct*100)}% computed on normalized proportions (not raw counts)")
-
-    records = []
-    for niche in all_niches:
-        niche_obs = obs[obs["niche"] == niche]
-
-        # Per-sample normalized proportions  (PITFALL 5: normalize before computing Gini)
-        per_sample_prop = {
-            s: float(niche_obs[niche_obs["sample"] == s].shape[0]) / float(sample_totals[s])
-            for s in all_samples
-        }
-        prop_values = np.array([per_sample_prop[s] for s in all_samples])
-
-        # SPR
-        spr = float((prop_values > 0).sum()) / total_samples
-
-        # Gini on normalized proportions
-        g = gini(prop_values)
-
-        # Top-X% concentration
-        n_top     = max(1, int(np.ceil(total_samples * args.top_pct)))
-        n_niche   = niche_obs.shape[0]
-        if n_niche > 0:
-            top_samples = sorted(all_samples, key=lambda s: per_sample_prop[s], reverse=True)[:n_top]
-            top_cells   = niche_obs[niche_obs["sample"].isin(top_samples)].shape[0]
-            conc        = float(top_cells) / float(n_niche)
+def prevalence_reading(spr: float, gini: float, top5: float,
+                       spr_thresh: float, gini_thresh: float, top5_thresh: float) -> str:
+    """Plain-language one-line reading of the three prevalence metrics."""
+    parts = []
+    if np.isnan(spr):
+        return "insufficient data"
+    parts.append(f"found in {spr * 100:.0f}% of samples")
+    if not np.isnan(gini):
+        if gini > gini_thresh:
+            parts.append(f"concentrated (Gini={gini:.2f} > {gini_thresh})")
         else:
-            conc = float("nan")
+            parts.append(f"evenly distributed (Gini={gini:.2f})")
+    if not np.isnan(top5):
+        if top5 > top5_thresh:
+            parts.append(f"top-5%% samples hold {top5 * 100:.0f}%% of cells")
+        else:
+            parts.append(f"top-5%% samples hold {top5 * 100:.0f}%% of cells (even)")
+    return "; ".join(parts)
 
-        records.append({
-            "niche":       niche,
-            "n_cells":     int(n_niche),
-            "n_samples":   int((prop_values > 0).sum()),
-            "spr":         round(spr, 4),
-            "gini":        round(g, 4) if not np.isnan(g) else float("nan"),
-            f"top{int(args.top_pct*100)}pct_conc": round(conc, 4) if not np.isnan(conc) else float("nan"),
-            "widespread":  spr   >= args.spr_min,
-            "gini_even":   (g    <  args.gini_threshold) if not np.isnan(g)    else None,
-            "conc_even":   (conc <  args.conc_threshold) if not np.isnan(conc) else None,
-        })
 
-    result_df = pd.DataFrame(records)
-    out_path  = out / "dim1_prevalence.csv"
-    result_df.to_csv(out_path, index=False)
-    print(f"\nWritten: {out_path}")
-    print("\nSummary:")
-    display_cols = ["niche", "spr", "gini", f"top{int(args.top_pct*100)}pct_conc", "widespread"]
-    print(result_df[display_cols].to_string(index=False))
-    print("\nInterpretation guide:")
-    print(f"  SPR ≥ {args.spr_min}         → niche is widespread across samples")
-    print(f"  Gini < {args.gini_threshold}        → niche abundance is evenly distributed across samples")
-    print(f"  Top-{int(args.top_pct*100)}% conc < {args.conc_threshold}  → niche is NOT dominated by a handful of samples")
-    print("\n=== dim1_prevalence.py complete ===")
+# ──────────────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────────────
+def main() -> None:
+    args = parse_args()
+    indir = Path(args.indir)
+    outdir = Path(args.outdir) if args.outdir else indir
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    h5ad_path = indir / "clean_data.h5ad"
+    if not h5ad_path.exists():
+        log.error("clean_data.h5ad not found in %s. Run validate.py first.", indir)
+        sys.exit(1)
+
+    log.info("Loading %s", h5ad_path)
+    adata = ad.read_h5ad(h5ad_path)
+    obs = adata.obs[["niche", "sample"]].copy()
+
+    all_samples = obs["sample"].unique()
+    S = len(all_samples)
+    all_niches = obs["niche"].unique()
+    log.info(
+        "  %d cells/spots | %d niches | %d samples",
+        len(obs), len(all_niches), S,
+    )
+
+    # Per-sample total counts (denominator for normalized proportions)
+    sample_totals = obs.groupby("sample", observed=True).size()
+
+    rows = []
+    for niche in sorted(all_niches):
+        niche_group = obs[obs["niche"] == niche]
+
+        # Raw counts per sample for this niche (only samples where it appears)
+        per_sample_raw = niche_group.groupby("sample", observed=True).size()
+
+        # Normalized proportion: niche cells / sample total cells
+        # Fills 0.0 for samples where the niche is absent (required for Gini/Top-5%)
+        per_sample_norm = (per_sample_raw / sample_totals).reindex(all_samples, fill_value=0.0)
+
+        n_present = int((per_sample_norm > 0).sum())
+        spr = n_present / S
+        gini = gini_coefficient(per_sample_norm.values)
+        top5 = top_k_pct_share(per_sample_raw, top_pct=0.05)
+
+        rows.append(
+            {
+                "niche": niche,
+                "n_cells_total": int(len(niche_group)),
+                "n_samples_present": n_present,
+                "n_samples_total": S,
+                "SPR": round(spr, 4),
+                "gini": round(gini, 4) if not np.isnan(gini) else np.nan,
+                "top5pct_share": round(top5, 4) if not np.isnan(top5) else np.nan,
+                "is_ubiquitous": spr >= args.spr_threshold,
+                "is_sample_specific": n_present == 1,
+                "is_concentrated_gini": (not np.isnan(gini)) and (gini > args.gini_threshold),
+                "is_concentrated_top5": (not np.isnan(top5)) and (top5 > args.top5_threshold),
+                "reading": prevalence_reading(
+                    spr, gini, top5,
+                    args.spr_threshold, args.gini_threshold, args.top5_threshold,
+                ),
+            }
+        )
+
+    result = (
+        pd.DataFrame(rows)
+        .set_index("niche")
+        .sort_values("SPR", ascending=False)
+    )
+
+    out_path = outdir / "dim1_prevalence.csv"
+    result.to_csv(out_path)
+    log.info("Written: %s  (%d niches)", out_path, len(result))
+
+    # ── Console summary ────────────────────────────────────────────────────────
+    log.info("=" * 60)
+    log.info("Dimension 1 — Cross-sample Prevalence")
+    log.info(
+        "  Ubiquitous niches      (SPR ≥ %.0f%%): %d / %d",
+        args.spr_threshold * 100,
+        result["is_ubiquitous"].sum(),
+        len(result),
+    )
+    log.info(
+        "  Sample-specific niches (present in 1 sample only): %d",
+        result["is_sample_specific"].sum(),
+    )
+    log.info(
+        "  Concentrated by Gini   (Gini > %.2f): %d",
+        args.gini_threshold,
+        result["is_concentrated_gini"].sum(),
+    )
+    log.info(
+        "  Concentrated by Top-5%% (share > %.0f%%): %d",
+        args.top5_threshold * 100,
+        result["is_concentrated_top5"].sum(),
+    )
+    log.info("  Median SPR : %.3f", result["SPR"].median())
+    log.info("  Median Gini: %.3f", result["gini"].median())
+    log.info("=" * 60)
 
 
 if __name__ == "__main__":
